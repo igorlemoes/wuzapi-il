@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,19 +17,137 @@ import (
 	"strings"
 	"time"
 
+	"bytes"
+	"math"
+	"os/exec"
+
 	"github.com/gorilla/mux"
 	"github.com/nfnt/resize"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog/log"
 	"github.com/vincent-petithory/dataurl"
 	"go.mau.fi/whatsmeow"
+	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-
 	"go.mau.fi/whatsmeow/types"
-	"google.golang.org/protobuf/proto"
 )
+
+// processAudioBytes usa ffprobe e ffmpeg em um arquivo temporário para a máxima robustez.
+// Esta abordagem evita problemas de compatibilidade com bibliotecas e pipes.
+func processAudioBytes(input []byte) ([]byte, int, error) {
+	if len(input) == 0 {
+		return nil, 0, errors.New("input audio data is empty")
+	}
+
+	// Cria um arquivo temporário para garantir que ffprobe/ffmpeg possam ler o arquivo de forma confiável.
+	tmpfile, err := os.CreateTemp("", "audio-*.ogg")
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpfile.Name()) // Garante a limpeza do arquivo temporário
+
+	if _, err := tmpfile.Write(input); err != nil {
+		return nil, 0, fmt.Errorf("failed to write to temp file: %w", err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		return nil, 0, fmt.Errorf("failed to close temp file: %w", err)
+	}
+	filePath := tmpfile.Name()
+	log.Printf("Audio data written to temporary file: %s", filePath)
+
+	// 1. Obter a duração usando ffprobe a partir do arquivo
+	ffprobeCmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath, // Usa o caminho do arquivo em vez de um pipe
+	)
+	var ffprobeOut, ffprobeErr bytes.Buffer
+	ffprobeCmd.Stdout = &ffprobeOut
+	ffprobeCmd.Stderr = &ffprobeErr
+	if err := ffprobeCmd.Run(); err != nil {
+		return nil, 0, fmt.Errorf("ffprobe failed: %w - %s", err, ffprobeErr.String())
+	}
+
+	durationStr := strings.TrimSpace(ffprobeOut.String())
+	if durationStr == "" || durationStr == "N/A" {
+		return nil, 0, fmt.Errorf("ffprobe could not determine duration from file: %s", ffprobeErr.String())
+	}
+	durationFloat, err := strconv.ParseFloat(durationStr, 64)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to parse duration from ffprobe ('%s'): %w", durationStr, err)
+	}
+	durationSeconds := int(math.Ceil(durationFloat))
+
+	// 2. Obter as amostras de áudio cruas usando ffmpeg a partir do arquivo
+	ffmpegCmd := exec.Command("ffmpeg",
+		"-i", filePath, // Usa o caminho do arquivo
+		"-f", "s16le", // Formato: raw signed 16-bit little-endian
+		"-ac", "1", // Mono
+		"-ar", "8000", // Taxa de amostragem de 8kHz para eficiência
+		"pipe:1", // A saída ainda pode ser um pipe
+	)
+	var ffmpegOut, ffmpegErr bytes.Buffer
+	ffmpegCmd.Stdout = &ffmpegOut
+	ffmpegCmd.Stderr = &ffmpegErr
+
+	if err := ffmpegCmd.Run(); err != nil {
+		return nil, 0, fmt.Errorf("ffmpeg raw conversion failed: %w - %s", err, ffmpegErr.String())
+	}
+
+	rawData := ffmpegOut.Bytes()
+	if len(rawData) == 0 {
+		return nil, 0, errors.New("ffmpeg produced empty raw audio data")
+	}
+
+	// 3. Processar as amostras cruas para gerar o waveform
+	numRawSamples := len(rawData) / 2
+	samples := make([]float64, numRawSamples)
+	for i := 0; i < numRawSamples; i++ {
+		sampleInt16 := int16(binary.LittleEndian.Uint16(rawData[i*2:]))
+		samples[i] = float64(sampleInt16) / 32768.0 // Normaliza para [-1.0, 1.0]
+	}
+
+	const numWaveformSamples = 64
+	blockSize := len(samples) / numWaveformSamples
+	if blockSize == 0 {
+		blockSize = 1
+	}
+
+	filteredData := make([]float64, numWaveformSamples)
+	var maxAmplitude float64 = 0
+	for i := 0; i < numWaveformSamples; i++ {
+		start := i * blockSize
+		end := start + blockSize
+		if end > len(samples) {
+			end = len(samples)
+		}
+		if start >= end {
+			continue
+		}
+		var sum float64
+		for j := start; j < end; j++ {
+			sum += math.Abs(samples[j])
+		}
+		avg := sum / float64(end-start)
+		filteredData[i] = avg
+		if avg > maxAmplitude {
+			maxAmplitude = avg
+		}
+	}
+
+	normalizedData := make([]byte, numWaveformSamples)
+	if maxAmplitude > 0 {
+		for i, val := range filteredData {
+			normalizedData[i] = byte((val / maxAmplitude) * 100)
+		}
+	}
+
+	return normalizedData, durationSeconds, nil
+}
+
 
 type Values struct {
 	m map[string]string
@@ -823,7 +941,6 @@ func (s *server) SendDocument() http.HandlerFunc {
 
 // Sends an audio message
 func (s *server) SendAudio() http.HandlerFunc {
-
 	type audioStruct struct {
 		Phone       string
 		Audio       string
@@ -833,83 +950,81 @@ func (s *server) SendAudio() http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 		msgid := ""
-		var resp whatsmeow.SendResponse
 
 		if clientManager.GetWhatsmeowClient(txtid) == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
 			return
 		}
 
-		decoder := json.NewDecoder(r.Body)
 		var t audioStruct
-		err := decoder.Decode(&t)
-		if err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
 			return
 		}
-
-		if t.Phone == "" {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("missing Phone in Payload"))
-			return
-		}
-
-		if t.Audio == "" {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("missing Audio in Payload"))
+		if t.Phone == "" || t.Audio == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("missing Phone or Audio in Payload"))
 			return
 		}
 
 		recipient, err := validateMessageFields(t.Phone, t.ContextInfo.StanzaID, t.ContextInfo.Participant)
 		if err != nil {
-			log.Error().Msg(fmt.Sprintf("%s", err))
 			s.Respond(w, r, http.StatusBadRequest, err)
 			return
 		}
-
 		if t.Id == "" {
 			msgid = clientManager.GetWhatsmeowClient(txtid).GenerateMessageID()
 		} else {
 			msgid = t.Id
 		}
 
-		var uploaded whatsmeow.UploadResponse
-		var filedata []byte
-
-		if t.Audio[0:14] == "data:audio/ogg" {
-			var dataURL, err = dataurl.DecodeString(t.Audio)
-			if err != nil {
-				s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode base64 encoded data from payload"))
-				return
-			} else {
-				filedata = dataURL.Data
-				uploaded, err = clientManager.GetWhatsmeowClient(txtid).Upload(context.Background(), filedata, whatsmeow.MediaAudio)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to upload file: %v", err)))
-					return
-				}
-			}
-		} else {
+		if !strings.HasPrefix(t.Audio, "data:audio/ogg;base64,") {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("audio data should start with \"data:audio/ogg;base64,\""))
 			return
 		}
 
-		ptt := true
-		mime := "audio/ogg; codecs=opus"
+		// Decode base64
+		audioDataURL, err := dataurl.DecodeString(t.Audio)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode base64 encoded audio"))
+			return
+		}
+		filedata := audioDataURL.Data
 
-		msg := &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
-			URL:        proto.String(uploaded.URL),
-			DirectPath: proto.String(uploaded.DirectPath),
-			MediaKey:   uploaded.MediaKey,
-			//Mimetype:      proto.String(http.DetectContentType(filedata)),
-			Mimetype:      &mime,
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:    uploaded.FileSHA256,
-			FileLength:    proto.Uint64(uint64(len(filedata))),
-			PTT:           &ptt,
-		}}
+		// Upload
+		uploaded, err := clientManager.GetWhatsmeowClient(txtid).Upload(context.Background(), filedata, whatsmeow.MediaAudio)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to upload file: %v", err))
+			return
+		}
 
+		// A chamada para a função de processamento otimizada.
+        waveform, durationSeconds, err := processAudioBytes(filedata)
+        if err != nil {
+            // O log de erro agora será muito mais informativo.
+            log.Printf("FATAL: Failed to process audio for waveform or duration: %v. Sending with fallback values.", err)
+            // Mantém o fallback para garantir o envio, mas agora sabemos por que falhou.
+            waveform = []byte("OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow==")
+            durationSeconds = 10
+        }
+
+        msg := &waE2E.Message{
+            AudioMessage: &waE2E.AudioMessage{
+                URL:           proto.String(uploaded.URL),
+                DirectPath:    proto.String(uploaded.DirectPath),
+                MediaKey:      uploaded.MediaKey,
+                Mimetype:      proto.String("audio/ogg; codecs=opus"),
+                FileEncSHA256: uploaded.FileEncSHA256,
+                FileSHA256:    uploaded.FileSHA256,
+                FileLength:    proto.Uint64(uploaded.FileLength),
+                Seconds:       proto.Uint32(uint32(durationSeconds)),
+                Waveform:      waveform,
+                PTT:           proto.Bool(true),
+            },
+        }
+
+		// Set ContextInfo
 		if t.ContextInfo.StanzaID != nil {
 			msg.ExtendedTextMessage.ContextInfo = &waE2E.ContextInfo{
 				StanzaID:      proto.String(*t.ContextInfo.StanzaID),
@@ -924,13 +1039,12 @@ func (s *server) SendAudio() http.HandlerFunc {
 			msg.ExtendedTextMessage.ContextInfo.MentionedJID = t.ContextInfo.MentionedJID
 		}
 
-		resp, err = clientManager.GetWhatsmeowClient(txtid).SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		resp, err := clientManager.GetWhatsmeowClient(txtid).SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("Error sending message: %v", err))
 			return
 		}
 
-		log.Info().Str("timestamp", fmt.Sprintf("%v", resp.Timestamp)).Str("id", msgid).Msg("Message sent")
 		response := map[string]interface{}{"Details": "Sent", "Timestamp": resp.Timestamp.Unix(), "Id": msgid}
 		responseJson, err := json.Marshal(response)
 		if err != nil {
@@ -938,9 +1052,9 @@ func (s *server) SendAudio() http.HandlerFunc {
 		} else {
 			s.Respond(w, r, http.StatusOK, string(responseJson))
 		}
-		return
 	}
 }
+
 
 // Sends an Image message
 func (s *server) SendImage() http.HandlerFunc {
