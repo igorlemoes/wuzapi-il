@@ -4366,7 +4366,7 @@ func (s *server) AddUser() http.HandlerFunc {
 		}
 
 		// Initialize S3Manager if necessary
-		if user.S3Config != nil && user.S3Config.Enabled {
+		if user.S3Config.Enabled {
 			s3Config := &S3Config{
 				Enabled:       user.S3Config.Enabled,
 				Endpoint:      user.S3Config.Endpoint,
@@ -4376,10 +4376,14 @@ func (s *server) AddUser() http.HandlerFunc {
 				SecretKey:     user.S3Config.SecretKey,
 				PathStyle:     user.S3Config.PathStyle,
 				PublicURL:     user.S3Config.PublicURL,
-				MediaDelivery: user.S3Config.MediaDelivery,
 				RetentionDays: user.S3Config.RetentionDays,
 			}
-			_ = GetS3Manager().InitializeS3Client(id, s3Config)
+			err = GetS3Manager().InitializeS3Client(id, s3Config)
+			if err != nil {
+				log.Error().Err(err).Str("userID", id).Msg("Failed to initialize S3 client on create user")
+			} else {
+				log.Info().Str("userID", id).Msg("S3 client initialized on create user")
+			}
 		}
 
 		// Build response like GET /admin/users
