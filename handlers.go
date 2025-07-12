@@ -4254,7 +4254,6 @@ func (s *server) ListUsers() http.HandlerFunc {
 	}
 }
 
-// Add user
 func (s *server) AddUser() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -4264,7 +4263,6 @@ func (s *server) AddUser() http.HandlerFunc {
 			ProxyURL string `json:"proxyURL"`
 		}
 
-		// Parse the request body
 		var user struct {
 			Name        string       `json:"name"`
 			Token       string       `json:"token"`
@@ -4284,24 +4282,22 @@ func (s *server) AddUser() http.HandlerFunc {
 			return
 		}
 
-		log.Info().Interface("proxyConfig", user.ProxyConfig).Interface("s3Config", user.S3Config).Msg("Received values for proxyConfig and s3Config")
-		log.Debug().Interface("user", user).Msg("Received values for user")
+		log.Info().Interface("proxyConfig", user.ProxyConfig).Interface("s3Config", user.S3Config).Msg("Received config from AddUser request")
+		log.Debug().Interface("user", user).Msg("Full user payload received")
 
-		// Set defaults only if nil
 		if user.Events == "" {
 			user.Events = ""
 		}
 		if user.ProxyConfig == nil {
 			user.ProxyConfig = &ProxyConfig{}
 		}
-		if user.S3Config == nil {
-			user.S3Config = &S3Config{}
-		}
 		if user.Webhook == "" {
 			user.Webhook = ""
 		}
+		if user.S3Config == nil {
+			user.S3Config = &S3Config{}
+		}
 
-		// Check for existing user
 		var count int
 		if err := s.db.Get(&count, "SELECT COUNT(*) FROM users WHERE token = $1", user.Token); err != nil {
 			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -4320,12 +4316,11 @@ func (s *server) AddUser() http.HandlerFunc {
 			return
 		}
 
-		// Validate events
 		eventList := strings.Split(user.Events, ",")
 		for _, event := range eventList {
 			event = strings.TrimSpace(event)
 			if event == "" {
-				continue // allow empty
+				continue
 			}
 			if !Find(supportedEventTypes, event) {
 				s.respondWithJSON(w, http.StatusBadRequest, map[string]interface{}{
@@ -4338,10 +4333,9 @@ func (s *server) AddUser() http.HandlerFunc {
 			}
 		}
 
-		// Generate ID
 		id, err := GenerateRandomID()
 		if err != nil {
-			log.Error().Err(err).Msg("failed to generate random ID")
+			log.Error().Err(err).Msg("Failed to generate user ID")
 			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
 				"code":    http.StatusInternalServerError,
 				"error":   "failed to generate user ID",
@@ -4350,13 +4344,22 @@ func (s *server) AddUser() http.HandlerFunc {
 			return
 		}
 
-		// Insert user with all proxy and S3 fields
 		if _, err = s.db.Exec(
-			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+			`INSERT INTO users (
+				id, name, token, webhook, expiration, events, jid, qrcode, proxy_url,
+				s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key,
+				s3_path_style, s3_public_url, media_delivery, s3_retention_days
+			) VALUES (
+				$1, $2, $3, $4, $5, $6, $7, $8, $9,
+				$10, $11, $12, $13, $14, $15,
+				$16, $17, $18, $19
+			)`,
 			id, user.Name, user.Token, user.Webhook, user.Expiration, user.Events, "", "", user.ProxyConfig.ProxyURL,
-			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays,
+			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket,
+			user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle,
+			user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays,
 		); err != nil {
-			log.Error().Str("error", fmt.Sprintf("%v", err)).Msg("admin DB error")
+			log.Error().Err(err).Msg("Database insert error")
 			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
 				"code":    http.StatusInternalServerError,
 				"error":   "database error",
@@ -4365,7 +4368,14 @@ func (s *server) AddUser() http.HandlerFunc {
 			return
 		}
 
-		// Initialize S3Manager if necessary
+		// --- S3 Initialization Debug Log ---
+		log.Info().
+			Bool("enabled", user.S3Config.Enabled).
+			Str("endpoint", user.S3Config.Endpoint).
+			Str("bucket", user.S3Config.Bucket).
+			Str("userID", id).
+			Msg("Checking if S3 client should be initialized")
+
 		if user.S3Config.Enabled {
 			s3Config := &S3Config{
 				Enabled:       user.S3Config.Enabled,
@@ -4378,20 +4388,37 @@ func (s *server) AddUser() http.HandlerFunc {
 				PublicURL:     user.S3Config.PublicURL,
 				RetentionDays: user.S3Config.RetentionDays,
 			}
-			err = GetS3Manager().InitializeS3Client(id, s3Config)
+
+			err := GetS3Manager().InitializeS3Client(id, s3Config)
 			if err != nil {
-				log.Error().Err(err).Str("userID", id).Msg("Failed to initialize S3 client on create user")
+				log.Error().Err(err).Str("userID", id).Msg("Failed to initialize S3 client")
 			} else {
-				log.Info().Str("userID", id).Msg("S3 client initialized on create user")
+				log.Info().Str("userID", id).Msg("S3 client initialized successfully")
+
+				// Confirm it's stored
+				client, config, ok := GetS3Manager().GetClient(id)
+				if !ok || client == nil {
+					log.Error().
+						Str("userID", id).
+						Interface("config", config).
+						Msg("S3 client not found or not properly initialized after AddUser")
+				} else {
+					log.Info().
+						Str("userID", id).
+						Str("endpoint", config.Endpoint).
+						Str("bucket", config.Bucket).
+						Msg("S3 client confirmed available in manager after AddUser")
+				}
+
 			}
 		}
 
-		// Build response like GET /admin/users
+		// --- Response payload ---
 		proxyConfig := map[string]interface{}{
 			"enabled":   user.ProxyConfig.Enabled,
 			"proxy_url": user.ProxyConfig.ProxyURL,
 		}
-		s3Config := map[string]interface{}{
+		s3Response := map[string]interface{}{
 			"enabled":        user.S3Config.Enabled,
 			"endpoint":       user.S3Config.Endpoint,
 			"region":         user.S3Config.Region,
@@ -4410,7 +4437,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			"expiration":   user.Expiration,
 			"events":       user.Events,
 			"proxy_config": proxyConfig,
-			"s3_config":    s3Config,
+			"s3_config":    s3Response,
 		}
 		s.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 			"code":    http.StatusCreated,
@@ -4419,6 +4446,7 @@ func (s *server) AddUser() http.HandlerFunc {
 		})
 	}
 }
+
 
 // Delete user
 func (s *server) DeleteUser() http.HandlerFunc {
