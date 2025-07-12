@@ -4426,6 +4426,28 @@ func (s *server) AddUser() http.HandlerFunc {
 			"MediaDelivery": user.S3Config.MediaDelivery,
 		}}, cache.NoExpiration)
 
+		// Inicia conexão do cliente WhatsApp (como no connectOnStartup)
+		killchannel[id] = make(chan bool)
+
+		eventarray := strings.Split(user.Events, ",")
+		var subscribedEvents []string
+		for _, evt := range eventarray {
+			evt = strings.TrimSpace(evt)
+			if evt == "" || !Find(supportedEventTypes, evt) {
+				continue
+			}
+			subscribedEvents = append(subscribedEvents, evt)
+		}
+
+		log.Info().
+			Str("events", strings.Join(subscribedEvents, ",")).
+			Str("jid", "").
+			Str("userID", id).
+			Msg("Calling startClient from AddUser")
+
+		go s.startClient(id, "", user.Token, subscribedEvents)
+
+
 		// --- Response ---
 		proxyConfig := map[string]interface{}{
 			"enabled":   user.ProxyConfig.Enabled,
