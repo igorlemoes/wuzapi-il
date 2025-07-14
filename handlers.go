@@ -86,7 +86,7 @@ func processAudioBytes(input []byte) ([]byte, int, error) {
 		"-i", filePath, // Usa o caminho do arquivo
 		"-f", "s16le", // Formato: raw signed 16-bit little-endian
 		"-ac", "1", // Mono
-		"-ar", "8000", // Taxa de amostragem de 8kHz para eficiência
+		"-ar", "48000", // Taxa de amostragem de 8kHz para eficiência
 		"pipe:1", // A saída ainda pode ser um pipe
 	)
 	var ffmpegOut, ffmpegErr bytes.Buffer
